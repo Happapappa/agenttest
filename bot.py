@@ -1,16 +1,14 @@
 """
-Telegram-бот на ZenMux — память, скиллы, зрение, генерация картинок и голос.
+Telegram-бот на ZenMux — приватный (только владелец), с памятью, скиллами,
+зрением, генерацией картинок и распознаванием голоса.
 
-Возможности:
-  - Постоянная память диалога (SQLite, переживает перезапуски бота)
-  - Скиллы-режимы под B2B-продажи (см. команды)
-  - Понимание картинок: пришли скриншот с подписью — бот прочитает
-  - Распознавание голоса: пришли голосовое — бот расшифрует и ответит
-  - Генерация картинок: /image описание
-  - Смена текстовой модели на лету: /model
+Приватность:
+  - Первый, кто напишет боту, становится владельцем; дальше бот отвечает только ему.
+  - Можно жёстко задать владельца переменной окружения OWNER_ID (число).
 
-Токены — из переменных окружения (в панели Bothost):
-    TELEGRAM_TOKEN, ZENMUX_API_KEY
+Переменные окружения (в панели Bothost):
+    TELEGRAM_TOKEN, ZENMUX_API_KEY   — обязательны
+    OWNER_ID                          — необязательно (число, Telegram ID владельца)
 
 Библиотеки: aiogram, openai, google-genai (см. requirements.txt).
 """
@@ -33,6 +31,10 @@ logging.basicConfig(level=logging.INFO)
 # ======================= КОНФИГ =======================
 TELEGRAM_TOKEN = os.environ["TELEGRAM_TOKEN"]
 ZENMUX_API_KEY = os.environ["ZENMUX_API_KEY"]
+
+# Необязательно: жёстко задать владельца (Telegram ID числом).
+_owner_env = os.environ.get("OWNER_ID", "").strip()
+OWNER_ID = int(_owner_env) if _owner_env.isdigit() else None
 
 # Модель по умолчанию для текста. Список id — на https://zenmux.ai/models
 DEFAULT_MODEL = "deepseek/deepseek-v4-flash"
@@ -142,7 +144,39 @@ with _db_lock:
         "CREATE TABLE IF NOT EXISTS settings ("
         " user_id INTEGER PRIMARY KEY, mode TEXT, model TEXT)"
     )
+    _conn.execute(
+        "CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT)"
+    )
     _conn.commit()
+
+
+def get_owner():
+    if OWNER_ID is not None:
+        return OWNER_ID
+    with _db_lock:
+        row = _conn.execute("SELECT value FROM meta WHERE key='owner'").fetchone()
+    return int(row[0]) if row else None
+
+
+def set_owner(user_id: int):
+    with _db_lock:
+        _conn.execute(
+            "INSERT INTO meta(key, value) VALUES('owner', ?) "
+            "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            (str(user_id),),
+        )
+        _conn.commit()
+
+
+def is_allowed(user_id: int) -> bool:
+    """Владелец задан жёстко (OWNER_ID) или первый написавший становится владельцем."""
+    if user_id is None:
+        return False
+    owner = get_owner()
+    if owner is None:
+        set_owner(user_id)  # первый написавший забирает бота себе
+        return True
+    return user_id == owner
 
 
 def get_settings(user_id: int):
@@ -192,15 +226,12 @@ def clear_history(user_id: int):
 
 
 # ======================= КЛИЕНТЫ =======================
-# Текст и зрение — через OpenAI-совместимый вход ZenMux.
 client = AsyncOpenAI(
     api_key=ZENMUX_API_KEY,
     base_url="https://zenmux.ai/api/v1",
     timeout=REQUEST_TIMEOUT,
 )
 
-# Gemini (Vertex AI на ZenMux) — для генерации картинок и распознавания голоса.
-# Оборачиваем в try, чтобы бот жил, даже если эти фичи недоступны.
 try:
     from google import genai
     from google.genai import types as genai_types
@@ -219,7 +250,6 @@ except Exception as e:  # noqa
 
 
 def generate_image(prompt: str):
-    """Синхронная генерация картинки. Возвращает bytes или None."""
     resp = gemini_client.models.generate_content(
         model=IMAGE_MODEL,
         contents=[prompt],
@@ -238,7 +268,6 @@ def generate_image(prompt: str):
 
 
 def transcribe_audio(audio_bytes: bytes, mime_type: str = "audio/ogg"):
-    """Синхронная расшифровка голоса. Возвращает текст."""
     resp = gemini_client.models.generate_content(
         model=ASR_MODEL,
         contents=[
@@ -254,8 +283,21 @@ bot = Bot(token=TELEGRAM_TOKEN)
 dp = Dispatcher()
 
 
+# ======================= ПРИВАТНОСТЬ (middleware) =======================
+@dp.message.middleware()
+async def owner_only(handler, event: Message, data):
+    user_id = event.from_user.id if event.from_user else None
+    if not is_allowed(user_id):
+        try:
+            await event.answer("Это приватный бот.")
+        except Exception:
+            pass
+        return  # чужих не пускаем к обработчикам
+    return await handler(event, data)
+
+
 def help_text() -> str:
-    lines = ["Я ассистент на ZenMux с памятью. Скиллы:\n"]
+    lines = ["Я твой приватный ассистент на ZenMux с памятью. Скиллы:\n"]
     for cmd, title in SKILL_TITLES.items():
         lines.append(f"/{cmd} — {title}")
     lines.append("\n/image <описание> — сгенерировать картинку")
@@ -267,7 +309,6 @@ def help_text() -> str:
     return "\n".join(lines)
 
 
-# ======================= ОБЩАЯ ЛОГИКА ОТВЕТА НА ТЕКСТ =======================
 async def respond_to_text(message: Message, user_id: int, user_text: str):
     mode, model = get_settings(user_id)
     add_message(user_id, "user", user_text)
@@ -290,7 +331,10 @@ async def respond_to_text(message: Message, user_id: int, user_text: str):
 # ======================= КОМАНДЫ =======================
 @dp.message(Command("start"))
 async def cmd_start(message: Message):
-    await message.answer("На связи, память включена.\n\n" + help_text())
+    await message.answer(
+        f"На связи. Бот закреплён за тобой (твой Telegram ID: {message.from_user.id}).\n\n"
+        + help_text()
+    )
 
 
 @dp.message(Command("help"))
@@ -441,7 +485,6 @@ async def handle_text(message: Message):
 
 
 async def send_long(message: Message, text: str):
-    """Telegram режет сообщения длиннее 4096 символов."""
     for i in range(0, len(text), 4000):
         await message.answer(text[i:i + 4000])
 
