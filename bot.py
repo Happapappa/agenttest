@@ -3,8 +3,8 @@ Telegram-бот на ZenMux (OpenAI-совместимый API).
 
 Запуск:
     pip install aiogram openai
-    export TELEGRAM_TOKEN="8733011176:AAEruUj1p3RbqAkse_IJHM6fVGWOeUKxoMw"      # токен от @BotFather
-    export ZENMUX_API_KEY="sk-ai-v1-9983631bb3ab4fb3afc224fb7196f2570214ad5480ca7d4fa3bcfc33902db2bd"      # ключ из дашборда ZenMux
+    export TELEGRAM_TOKEN="345"      # токен от @BotFather
+    export ZENMUX_API_KEY="sk-"      # ключ из дашборда ZenMux
     python bot.py
 
 ZenMux полностью совместим с протоколом OpenAI, поэтому используем
