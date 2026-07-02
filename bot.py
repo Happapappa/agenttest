@@ -30,7 +30,7 @@ ZENMUX_API_KEY = os.environ["ZENMUX_API_KEY"]
 # Точное имя модели смотри на https://zenmux.ai/models — формат provider/model.
 # Примеры: "openai/gpt-4o", "anthropic/claude-sonnet-4.5", "deepseek/deepseek-chat",
 #          "qwen/qwen3-max", "minimax/...". Проверь актуальный id для DeepSeek/MiniMax.
-DEFAULT_MODEL = "anthropic/claude-sonnet-5-free"
+DEFAULT_MODEL = "anthropic/claude-sonnet-5"
 
 SYSTEM_PROMPT = (
     "SYSTEM_PROMPT = "Ты — полезный ассистент. Отвечай кратко и по делу на русском."
