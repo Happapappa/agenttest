@@ -33,8 +33,7 @@ ZENMUX_API_KEY = os.environ["ZENMUX_API_KEY"]
 DEFAULT_MODEL = "anthropic/claude-sonnet-5"
 
 SYSTEM_PROMPT = (
-    "SYSTEM_PROMPT = "Ты  полезный ассистент. Отвечай кратко и по делу на русском.")
-
+    SYSTEM_PROMPT = "Ты — полезный ассистент. Отвечай кратко и по делу на русском."
 MAX_HISTORY = 12          # сколько последних сообщений держим в контексте (без учёта system)
 REQUEST_TIMEOUT = 60      # сек
 
