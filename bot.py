@@ -33,9 +33,7 @@ ZENMUX_API_KEY = os.environ["ZENMUX_API_KEY"]
 DEFAULT_MODEL = "deepseek/deepseek-chat"
 
 SYSTEM_PROMPT = (
-    "Ты — MaxHermes, ассистент по enterprise B2B-продажам IaaS. "
-    "Отвечаешь по делу, без воды, на русском. "
-    "Помогаешь с KYC, квалификацией по MEDDPICC, холодными заходами и разбором сделок."
+    "SYSTEM_PROMPT = "Ты — полезный ассистент. Отвечай кратко и по делу на русском."
 )
 
 MAX_HISTORY = 12          # сколько последних сообщений держим в контексте (без учёта system)
