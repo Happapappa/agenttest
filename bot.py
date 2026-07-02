@@ -1,11 +1,12 @@
 """
-Telegram-бот на ZenMux — память, скиллы под продажи, зрение и генерация картинок.
+Telegram-бот на ZenMux — память, скиллы, зрение, генерация картинок и голос.
 
 Возможности:
   - Постоянная память диалога (SQLite, переживает перезапуски бота)
   - Скиллы-режимы под B2B-продажи (см. команды)
   - Понимание картинок: пришли скриншот с подписью — бот прочитает
-  - Генерация картинок: /image описание  (модель Nano Banana 2 Lite)
+  - Распознавание голоса: пришли голосовое — бот расшифрует и ответит
+  - Генерация картинок: /image описание
   - Смена текстовой модели на лету: /model
 
 Токены — из переменных окружения (в панели Bothost):
@@ -39,6 +40,8 @@ DEFAULT_MODEL = "deepseek/deepseek-v4-flash"
 VISION_MODEL = "deepseek/deepseek-v4-flash"
 # Модель для ГЕНЕРАЦИИ картинок (Nano Banana 2 Lite).
 IMAGE_MODEL = "google/gemini-3.1-flash-lite-image"
+# Модель для РАСПОЗНАВАНИЯ голоса (Gemini умеет аудио, принимает OGG из Telegram).
+ASR_MODEL = "google/gemini-3-flash-preview"
 
 DB_PATH = "bot_memory.db"
 MAX_TURNS = 14
@@ -196,28 +199,28 @@ client = AsyncOpenAI(
     timeout=REQUEST_TIMEOUT,
 )
 
-# Генерация картинок — через протокол Google (Vertex AI) на ZenMux.
-# Оборачиваем в try, чтобы бот жил, даже если генерация недоступна.
+# Gemini (Vertex AI на ZenMux) — для генерации картинок и распознавания голоса.
+# Оборачиваем в try, чтобы бот жил, даже если эти фичи недоступны.
 try:
     from google import genai
     from google.genai import types as genai_types
 
-    image_client = genai.Client(
+    gemini_client = genai.Client(
         api_key=ZENMUX_API_KEY,
         vertexai=True,
         http_options=genai_types.HttpOptions(
             api_version="v1", base_url="https://zenmux.ai/api/vertex-ai"
         ),
     )
-    IMAGE_ENABLED = True
+    GEMINI_ENABLED = True
 except Exception as e:  # noqa
-    logging.warning("Генерация картинок отключена: %s", e)
-    IMAGE_ENABLED = False
+    logging.warning("Gemini-функции (картинки/голос) отключены: %s", e)
+    GEMINI_ENABLED = False
 
 
 def generate_image(prompt: str):
-    """Синхронная генерация. Возвращает bytes картинки или None."""
-    resp = image_client.models.generate_content(
+    """Синхронная генерация картинки. Возвращает bytes или None."""
+    resp = gemini_client.models.generate_content(
         model=IMAGE_MODEL,
         contents=[prompt],
         config=genai_types.GenerateContentConfig(
@@ -234,6 +237,19 @@ def generate_image(prompt: str):
     return None
 
 
+def transcribe_audio(audio_bytes: bytes, mime_type: str = "audio/ogg"):
+    """Синхронная расшифровка голоса. Возвращает текст."""
+    resp = gemini_client.models.generate_content(
+        model=ASR_MODEL,
+        contents=[
+            "Расшифруй это голосовое сообщение дословно. "
+            "Верни только текст расшифровки, без комментариев.",
+            genai_types.Part.from_bytes(data=audio_bytes, mime_type=mime_type),
+        ],
+    )
+    return (resp.text or "").strip()
+
+
 bot = Bot(token=TELEGRAM_TOKEN)
 dp = Dispatcher()
 
@@ -247,7 +263,28 @@ def help_text() -> str:
     lines.append("/mode — текущий режим")
     lines.append("/reset — очистить память диалога")
     lines.append("\nМожно прислать скриншот с подписью — прочитаю картинку.")
+    lines.append("Можно прислать голосовое — расшифрую и отвечу.")
     return "\n".join(lines)
+
+
+# ======================= ОБЩАЯ ЛОГИКА ОТВЕТА НА ТЕКСТ =======================
+async def respond_to_text(message: Message, user_id: int, user_text: str):
+    mode, model = get_settings(user_id)
+    add_message(user_id, "user", user_text)
+    history = get_history(user_id)
+    messages = [{"role": "system", "content": PROMPTS[mode]}, *history]
+
+    await bot.send_chat_action(message.chat.id, "typing")
+    try:
+        resp = await client.chat.completions.create(model=model, messages=messages)
+        answer = resp.choices[0].message.content
+    except Exception as e:
+        logging.exception("ZenMux error")
+        await message.answer(f"Ошибка запроса к модели: {e}")
+        return
+
+    add_message(user_id, "assistant", answer)
+    await send_long(message, answer)
 
 
 # ======================= КОМАНДЫ =======================
@@ -292,7 +329,7 @@ async def cmd_model(message: Message):
 
 @dp.message(Command(commands=["image", "img"]))
 async def cmd_image(message: Message):
-    if not IMAGE_ENABLED:
+    if not GEMINI_ENABLED:
         await message.answer("Генерация картинок сейчас недоступна.")
         return
     parts = message.text.split(maxsplit=1)
@@ -325,6 +362,36 @@ async def set_mode(message: Message):
     await message.answer(
         f"Режим: /{cmd} — {SKILL_TITLES.get(cmd, cmd)}. Память очищена, пиши запрос."
     )
+
+
+# ======================= ГОЛОСОВЫЕ =======================
+@dp.message(F.voice | F.audio)
+async def handle_voice(message: Message):
+    if not GEMINI_ENABLED:
+        await message.answer("Распознавание голоса сейчас недоступно.")
+        return
+    user_id = message.from_user.id
+
+    media = message.voice or message.audio
+    mime = getattr(media, "mime_type", None) or "audio/ogg"
+    file = await bot.get_file(media.file_id)
+    buf = await bot.download_file(file.file_path)
+    audio_bytes = buf.read()
+
+    await bot.send_chat_action(message.chat.id, "typing")
+    try:
+        text = await asyncio.to_thread(transcribe_audio, audio_bytes, mime)
+    except Exception as e:
+        logging.exception("ASR error")
+        await message.answer(f"Не смог распознать голос: {e}")
+        return
+
+    if not text:
+        await message.answer("Не расслышал. Попробуй записать ещё раз.")
+        return
+
+    await message.answer(f"🎤 {text}")
+    await respond_to_text(message, user_id, text)
 
 
 # ======================= ПОНИМАНИЕ КАРТИНОК =======================
@@ -370,24 +437,7 @@ async def handle_photo(message: Message):
 # ======================= ТЕКСТ =======================
 @dp.message(F.text)
 async def handle_text(message: Message):
-    user_id = message.from_user.id
-    mode, model = get_settings(user_id)
-
-    add_message(user_id, "user", message.text)
-    history = get_history(user_id)
-    messages = [{"role": "system", "content": PROMPTS[mode]}, *history]
-
-    await bot.send_chat_action(message.chat.id, "typing")
-    try:
-        resp = await client.chat.completions.create(model=model, messages=messages)
-        answer = resp.choices[0].message.content
-    except Exception as e:
-        logging.exception("ZenMux error")
-        await message.answer(f"Ошибка запроса к модели: {e}")
-        return
-
-    add_message(user_id, "assistant", answer)
-    await send_long(message, answer)
+    await respond_to_text(message, message.from_user.id, message.text)
 
 
 async def send_long(message: Message, text: str):
