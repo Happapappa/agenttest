@@ -4,7 +4,7 @@ Telegram-бот на ZenMux (OpenAI-совместимый API).
 Запуск:
     pip install aiogram openai
     export TELEGRAM_TOKEN="345"      # токен от @BotFather
-    export ZENMUX_API_KEY="sk-"      # ключ из дашборда ZenMux
+    export ZENMUX_API_KEY="sk"      # ключ из дашборда ZenMux
     python bot.py
 
 ZenMux полностью совместим с протоколом OpenAI, поэтому используем
@@ -33,8 +33,7 @@ ZENMUX_API_KEY = os.environ["ZENMUX_API_KEY"]
 DEFAULT_MODEL = "anthropic/claude-sonnet-5"
 
 SYSTEM_PROMPT = (
-    "SYSTEM_PROMPT = "Ты — полезный ассистент. Отвечай кратко и по делу на русском."
-)
+    "SYSTEM_PROMPT = "Ты — полезный ассистент. Отвечай кратко и по делу на русском.")
 
 MAX_HISTORY = 12          # сколько последних сообщений держим в контексте (без учёта system)
 REQUEST_TIMEOUT = 60      # сек
