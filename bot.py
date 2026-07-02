@@ -34,9 +34,9 @@ TELEGRAM_TOKEN = os.environ["TELEGRAM_TOKEN"]
 ZENMUX_API_KEY = os.environ["ZENMUX_API_KEY"]
 
 # Модель по умолчанию для текста. Список id — на https://zenmux.ai/models
-DEFAULT_MODEL = "deepseek/deepseek-chat"
+DEFAULT_MODEL = "deepseek/deepseek-v4-flash"
 # Модель для понимания картинок (зрение). Бюджетная, хороша для скриншотов/OCR.
-VISION_MODEL = "google/gemini-3-flash-preview"
+VISION_MODEL = "deepseek/deepseek-v4-flash"
 # Модель для ГЕНЕРАЦИИ картинок (Nano Banana 2 Lite).
 IMAGE_MODEL = "google/gemini-3.1-flash-lite-image"
 
