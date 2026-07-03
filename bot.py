@@ -44,6 +44,9 @@ VISION_MODEL = "deepseek/deepseek-v4-flash"
 IMAGE_MODEL = "google/gemini-3.1-flash-lite-image"
 # Модель для РАСПОЗНАВАНИЯ голоса (Gemini умеет аудио, принимает OGG из Telegram).
 ASR_MODEL = "google/gemini-3-flash-preview"
+# Веб-поиск: если True — модель ходит в интернет на КАЖДЫЙ текстовый запрос.
+WEB_SEARCH = True
+MAX_SEARCH_RESULTS = 5
 
 DB_PATH = "bot_memory.db"
 MAX_TURNS = 14
@@ -288,11 +291,7 @@ dp = Dispatcher()
 async def owner_only(handler, event: Message, data):
     user_id = event.from_user.id if event.from_user else None
     if not is_allowed(user_id):
-        try:
-            await event.answer("Это приватный бот.")
-        except Exception:
-            pass
-        return  # чужих не пускаем к обработчикам
+        return  # чужих молча игнорируем: ни ответа, ни запросов к модели
     return await handler(event, data)
 
 
@@ -316,8 +315,14 @@ async def respond_to_text(message: Message, user_id: int, user_text: str):
     messages = [{"role": "system", "content": PROMPTS[mode]}, *history]
 
     await bot.send_chat_action(message.chat.id, "typing")
+    kwargs = {"model": model, "messages": messages}
+    if WEB_SEARCH:
+        # ZenMux включает веб-поиск через web_search_options.
+        kwargs["extra_body"] = {
+            "web_search_options": {"enabled": True, "max_results": MAX_SEARCH_RESULTS}
+        }
     try:
-        resp = await client.chat.completions.create(model=model, messages=messages)
+        resp = await client.chat.completions.create(**kwargs)
         answer = resp.choices[0].message.content
     except Exception as e:
         logging.exception("ZenMux error")
