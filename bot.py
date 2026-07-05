@@ -44,9 +44,17 @@ VISION_MODEL = "deepseek/deepseek-v4-flash"
 IMAGE_MODEL = "google/gemini-3.1-flash-lite-image"
 # Модель для РАСПОЗНАВАНИЯ голоса (Gemini умеет аудио, принимает OGG из Telegram).
 ASR_MODEL = "google/gemini-3-flash-preview"
-# Веб-поиск: если True — модель ходит в интернет на КАЖДЫЙ текстовый запрос.
-WEB_SEARCH = True
+# Веб-поиск: DeepSeek на ZenMux поиск НЕ умеет, поэтому «поиск на каждое сообщение»
+# выключен. Реальный поиск идёт через отдельную модель (SEARCH_MODEL) по команде
+# /search и в дайджестах.
+WEB_SEARCH = False
 MAX_SEARCH_RESULTS = 5
+# Модель для веб-поиска (умеет ходить в интернет на ZenMux).
+SEARCH_MODEL = "google/gemini-3-flash-preview"
+
+# Дайджесты: бот сам присылает сводку по темам раз в день.
+MSK_OFFSET = 3          # сервер в UTC, а ты в Москве (UTC+3)
+DEFAULT_DIGEST_HOUR = 9  # час по Москве по умолчанию
 
 DB_PATH = "bot_memory.db"
 MAX_TURNS = 14
@@ -150,7 +158,44 @@ with _db_lock:
     _conn.execute(
         "CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT)"
     )
+    _conn.execute(
+        "CREATE TABLE IF NOT EXISTS topics (id INTEGER PRIMARY KEY AUTOINCREMENT, topic TEXT)"
+    )
     _conn.commit()
+
+
+def get_meta(key: str, default=None):
+    with _db_lock:
+        row = _conn.execute("SELECT value FROM meta WHERE key=?", (key,)).fetchone()
+    return row[0] if row else default
+
+
+def set_meta(key: str, value: str):
+    with _db_lock:
+        _conn.execute(
+            "INSERT INTO meta(key, value) VALUES(?, ?) "
+            "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            (key, str(value)),
+        )
+        _conn.commit()
+
+
+def get_topics():
+    with _db_lock:
+        rows = _conn.execute("SELECT id, topic FROM topics ORDER BY id").fetchall()
+    return rows  # список (id, topic)
+
+
+def add_topic(topic: str):
+    with _db_lock:
+        _conn.execute("INSERT INTO topics(topic) VALUES(?)", (topic,))
+        _conn.commit()
+
+
+def del_topic(topic_id: int):
+    with _db_lock:
+        _conn.execute("DELETE FROM topics WHERE id=?", (topic_id,))
+        _conn.commit()
 
 
 def get_owner():
@@ -299,10 +344,17 @@ def help_text() -> str:
     lines = ["Я твой приватный ассистент на ZenMux с памятью. Скиллы:\n"]
     for cmd, title in SKILL_TITLES.items():
         lines.append(f"/{cmd} — {title}")
-    lines.append("\n/image <описание> — сгенерировать картинку")
+    lines.append("\n/search <запрос> — поиск в интернете (свежие данные)")
+    lines.append("/image <описание> — сгенерировать картинку")
     lines.append("/model — показать/сменить текстовую модель")
     lines.append("/mode — текущий режим")
     lines.append("/reset — очистить память диалога")
+    lines.append("\nДайджесты (бот сам присылает раз в день):")
+    lines.append("/topics — список тем")
+    lines.append("/addtopic <тема> — добавить тему")
+    lines.append("/deltopic <номер> — удалить тему")
+    lines.append("/digesttime <час> — время дайджеста (по Москве)")
+    lines.append("/digestnow — прислать дайджест сейчас")
     lines.append("\nМожно прислать скриншот с подписью — прочитаю картинку.")
     lines.append("Можно прислать голосовое — расшифрую и отвечу.")
     return "\n".join(lines)
@@ -401,6 +453,44 @@ async def cmd_image(message: Message):
         await message.answer("Модель не вернула картинку, попробуй переформулировать запрос.")
 
 
+@dp.message(Command("search"))
+async def cmd_search(message: Message):
+    parts = message.text.split(maxsplit=1)
+    if len(parts) < 2:
+        await message.answer("Что найти? Пример:\n/search новости Сбербанка за неделю")
+        return
+    user_id = message.from_user.id
+    query = parts[1].strip()
+    add_message(user_id, "user", f"[поиск] {query}")
+
+    await bot.send_chat_action(message.chat.id, "typing")
+    try:
+        resp = await client.chat.completions.create(
+            model=SEARCH_MODEL,
+            messages=[{
+                "role": "user",
+                "content": (
+                    f"Найди в интернете свежую информацию и ответь на запрос: {query}. "
+                    "Опирайся на актуальные данные, по-русски, "
+                    "и приведи ссылки на источники, если есть."
+                ),
+            }],
+            extra_body={
+                "web_search_options": {
+                    "enabled": True, "max_results": MAX_SEARCH_RESULTS
+                }
+            },
+        )
+        answer = resp.choices[0].message.content
+    except Exception as e:
+        logging.exception("Search error")
+        await message.answer(f"Ошибка поиска: {e}")
+        return
+
+    add_message(user_id, "assistant", answer)
+    await send_long(message, answer)
+
+
 @dp.message(Command(commands=list(PROMPTS.keys())))
 async def set_mode(message: Message):
     user_id = message.from_user.id
@@ -494,10 +584,121 @@ async def send_long(message: Message, text: str):
         await message.answer(text[i:i + 4000])
 
 
+# ======================= ДАЙДЖЕСТЫ =======================
+@dp.message(Command("topics"))
+async def cmd_topics(message: Message):
+    topics = get_topics()
+    if not topics:
+        await message.answer(
+            "Тем пока нет. Добавь: /addtopic GPU и AI-инфраструктура"
+        )
+        return
+    lines = ["Твои темы для дайджеста:"]
+    for tid, topic in topics:
+        lines.append(f"{tid}. {topic}")
+    hour = get_meta("digest_hour", str(DEFAULT_DIGEST_HOUR))
+    lines.append(f"\nВремя рассылки: {hour}:00 по Москве.")
+    await message.answer("\n".join(lines))
+
+
+@dp.message(Command("addtopic"))
+async def cmd_addtopic(message: Message):
+    parts = message.text.split(maxsplit=1)
+    if len(parts) < 2:
+        await message.answer("Напиши тему. Пример:\n/addtopic новости GPU и дата-центров")
+        return
+    add_topic(parts[1].strip())
+    await message.answer("Тема добавлена. Список: /topics")
+
+
+@dp.message(Command("deltopic"))
+async def cmd_deltopic(message: Message):
+    parts = message.text.split(maxsplit=1)
+    if len(parts) < 2 or not parts[1].strip().isdigit():
+        await message.answer("Укажи номер темы из /topics. Пример: /deltopic 2")
+        return
+    del_topic(int(parts[1].strip()))
+    await message.answer("Тема удалена. Список: /topics")
+
+
+@dp.message(Command("digesttime"))
+async def cmd_digesttime(message: Message):
+    parts = message.text.split(maxsplit=1)
+    if len(parts) < 2 or not parts[1].strip().isdigit() or not (0 <= int(parts[1]) <= 23):
+        await message.answer("Укажи час 0–23 по Москве. Пример: /digesttime 9")
+        return
+    set_meta("digest_hour", int(parts[1].strip()))
+    await message.answer(f"Дайджест буду присылать в {int(parts[1])}:00 по Москве.")
+
+
+@dp.message(Command("digestnow"))
+async def cmd_digestnow(message: Message):
+    await message.answer("Собираю дайджест, пара минут...")
+    await bot.send_chat_action(message.chat.id, "typing")
+    text = await build_digest()
+    if text:
+        await send_long(message, text)
+    else:
+        await message.answer("Тем нет. Добавь через /addtopic.")
+
+
+async def build_digest() -> str:
+    """Собирает свежую сводку по всем темам через веб-поиск."""
+    topics = get_topics()
+    if not topics:
+        return ""
+    parts = ["📰 Дайджест на сегодня\n"]
+    for _, topic in topics:
+        prompt = (
+            f"Дай краткую сводку самых свежих новостей и событий по теме: «{topic}». "
+            "Только за последние дни, тезисно (3-5 пунктов), по-русски. "
+            "Если есть ссылки на источники — приведи их."
+        )
+        try:
+            resp = await client.chat.completions.create(
+                model=SEARCH_MODEL,
+                messages=[{"role": "user", "content": prompt}],
+                extra_body={
+                    "web_search_options": {
+                        "enabled": True, "max_results": MAX_SEARCH_RESULTS
+                    }
+                },
+            )
+            body = resp.choices[0].message.content
+        except Exception as e:
+            logging.exception("Digest error")
+            body = f"(не удалось собрать: {e})"
+        parts.append(f"\n🔹 {topic}\n{body}")
+    return "\n".join(parts)
+
+
+async def digest_scheduler():
+    """Раз в день в заданный час (по Москве) шлёт дайджест владельцу."""
+    while True:
+        try:
+            now = time.gmtime(time.time() + MSK_OFFSET * 3600)  # московское время
+            hour = int(get_meta("digest_hour", str(DEFAULT_DIGEST_HOUR)))
+            today = time.strftime("%Y-%m-%d", now)
+            already = get_meta("digest_last_date", "")
+            owner = get_owner()
+            if owner and now.tm_hour == hour and already != today and get_topics():
+                text = await build_digest()
+                if text:
+                    for i in range(0, len(text), 4000):
+                        await bot.send_message(owner, text[i:i + 4000])
+                set_meta("digest_last_date", today)
+        except Exception:
+            logging.exception("Scheduler error")
+        await asyncio.sleep(60)  # проверяем раз в минуту
+
+
 async def set_menu():
     commands = [BotCommand(command=c, description=t) for c, t in SKILL_TITLES.items()]
     commands += [
+        BotCommand(command="search", description="поиск в интернете"),
         BotCommand(command="image", description="сгенерировать картинку"),
+        BotCommand(command="topics", description="темы дайджеста"),
+        BotCommand(command="digestnow", description="дайджест сейчас"),
         BotCommand(command="model", description="сменить модель"),
         BotCommand(command="reset", description="очистить память"),
         BotCommand(command="help", description="справка"),
@@ -507,6 +708,7 @@ async def set_menu():
 
 async def main():
     await set_menu()
+    asyncio.create_task(digest_scheduler())
     await dp.start_polling(bot)
 
 
